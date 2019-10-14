@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import numpy as np
 import scipy.misc as misc
 import cv2
@@ -70,3 +70,69 @@ class BasicDataset(object):
         dataset = dataset.repeat()
         iterator = dataset.make_initializable_iterator()
         return iterator     
+
+    def create_batch_iterator(self, data_list, batch_size, shuffle=True, buffer_size=5000, num_parallel_calls=4):
+        data_list = tf.convert_to_tensor(data_list, dtype=tf.string)
+        dataset = tf.data.Dataset.from_tensor_slices(data_list)
+        dataset = dataset.map(self.preprocess_augmentation, num_parallel_calls=num_parallel_calls)
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size=buffer_size)
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.repeat()
+        iterator = dataset.make_initializable_iterator()
+        return iterator
+
+    def create_batch_distillation_iterator(self, data_list, batch_size, shuffle=True, buffer_size=5000, num_parallel_calls=4):
+        data_list = tf.convert_to_tensor(data_list, dtype=tf.string)
+        dataset = tf.data.Dataset.from_tensor_slices(data_list)
+        dataset = dataset.map(self.preprocess_augmentation_distillation, num_parallel_calls=num_parallel_calls)
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size=buffer_size)
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.repeat()
+        iterator = dataset.make_initializable_iterator()
+        return iterator    
+
+    def preprocess_augmentation(self, filename_queue):
+        img1, img2, img3, img4, img5 = self.read_and_decode(filename_queue)
+        img1 = img1 / 255.
+        img2 = img2 / 255.
+        img3 = img3 / 255.
+        img4 = img4 / 255.
+        img5 = img5 / 255.        
+        img1, img2, img3, img4, img5 = self.augmentation(img1, img2, img3, img4, img5)
+        return img1, img2, img3, img4, img5
+
+    def preprocess_augmentation_distillation(self, filename_queue):
+        img1, img2, img3, img4, img5, flow_fw, flow_bw, occ_fw, occ_bw = self.read_and_decode_distillation(filename_queue)
+        img1 = img1 / 255.
+        img2 = img2 / 255.
+        img3 = img3 / 255.
+        img4 = img4 / 255.
+        img5 = img5 / 255.           
+        img1, img2, flow_fw, flow_bw, occ_fw, occ_bw = self.augmentation_distillation(img1, img2, flow_fw, flow_bw, occ_fw, occ_bw)
+        return img1, img2, flow_fw, flow_bw, occ_fw, occ_bw 
+
+    def read_and_decode(self, filename_queue):
+        img1_name = tf.string_join([self.img_dir, '/', filename_queue[0]])
+        img2_name = tf.string_join([self.img_dir, '/', filename_queue[1]])
+        img3_name = tf.string_join([self.img_dir, '/', filename_queue[2]])
+        img4_name = tf.string_join([self.img_dir, '/', filename_queue[3]])
+        img5_name = tf.string_join([self.img_dir, '/', filename_queue[4]])
+        img1 = tf.image.decode_png(tf.read_file(img1_name), channels=3)
+        img1 = tf.cast(img1, tf.float32)
+        img2 = tf.image.decode_png(tf.read_file(img2_name), channels=3)
+        img2 = tf.cast(img2, tf.float32)   
+        img3 = tf.image.decode_png(tf.read_file(img3_name), channels=3)
+        img3 = tf.cast(img3, tf.float32)
+        img4 = tf.image.decode_png(tf.read_file(img4_name), channels=3)
+        img4 = tf.cast(img4, tf.float32)  
+        img5 = tf.image.decode_png(tf.read_file(img5_name), channels=3)
+        img5 = tf.cast(img5, tf.float32)         
+        return img1, img2, img3, img4, img5
+
+    def augmentation(self, img1, img2, img3, img4, img5):
+        img1, img2, img3, img4, img5 = random_crop([img1, img2, img3, img4, img5], self.crop_h, self.crop_w)
+        img1, img2, img3, img4, img5 = random_flip([img1, img2, img3, img4, img5])
+        img1, img2, img3, img4, img5 = random_channel_swap([img1, img2, img3, img4, img5])
+        return img1, img2, img3, img4, img5

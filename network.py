@@ -1,4 +1,4 @@
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 from tensorflow.contrib import slim
 from data_augmentation import flow_resize
 from utils import lrelu
@@ -162,3 +162,10 @@ def pyramid_processing_five_frame(batch_img0, batch_img1, batch_img2, batch_img3
     flow_fw_34, flow_bw_32 = pyramid_processing_three_frame(batch_img0, x2_feature, x3_feature, x4_feature, train=train, trainable=trainable, reuse=True, regularizer=regularizer, is_scale=is_scale)
         
     return flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32
+
+def get_shape(x, train=True):
+    if train:
+        x_shape = x.get_shape().as_list()
+    else:
+        x_shape = tf.shape(x)      
+    return x_shape

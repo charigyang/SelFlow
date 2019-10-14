@@ -7,7 +7,6 @@ from config.extract_config import config_dict
 
 # manually select one or several free gpu 
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
-#os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
 
 # autonatically select one free gpu
@@ -17,7 +16,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
 
 
 def main(_):
-    config = config_dict('./config/config.ini')
+    config = config_dict('./config/config_test.ini')
     run_config = config['run']
     dataset_config = config['dataset']    
     self_supervision_config = config['self_supervision']
@@ -55,9 +54,6 @@ def main(_):
         model.test(restore_model=config['test']['restore_model'],
                    save_dir=config['test']['save_dir'],
                    is_normalize_img=dataset_config['is_normalize_img'])
-    elif run_config['mode'] == 'generate_fake_flow_occlusion':
-        model.generate_fake_flow_occlusion(restore_model=config['generate_fake_flow_occlusion']['restore_model'],
-                                           save_dir=config['generate_fake_flow_occlusion']['save_dir'])
     else:
         raise ValueError('Invalid mode. Mode should be one of {test}')
 
