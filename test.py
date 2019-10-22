@@ -54,6 +54,10 @@ def main(_):
         model.test(restore_model=config['test']['restore_model'],
                    save_dir=config['test']['save_dir'],
                    is_normalize_img=dataset_config['is_normalize_img'])
+    elif run_config['mode'] == 'eval':
+        model.eval(restore_model=config['test']['restore_model'],
+                   save_dir=config['test']['save_dir'],
+                   is_normalize_img=dataset_config['is_normalize_img'])
     else:
         raise ValueError('Invalid mode. Mode should be one of {test}')
 

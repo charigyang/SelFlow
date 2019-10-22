@@ -14,10 +14,11 @@ from tensorflow.contrib import slim
 import matplotlib.pyplot as plt
 from network import pyramid_processing, pyramid_processing_five_frame, get_shape
 from datasets import BasicDataset
-from utils import average_gradients, lrelu, occlusion, rgb_bgr
+from utils import average_gradients, lrelu, occlusion, rgb_bgr, compute_Fl
 from data_augmentation import flow_resize
-from flowlib import flow_to_color, write_flo
+from flowlib import flow_to_color, write_flo, flow_error_image
 from warp import tf_warp
+from skimage.segmentation import slic
 
 class SelFlowModel(object):
     def __init__(self, batch_size=8, iter_steps=1000000, initial_learning_rate=1e-4, decay_steps=2e5, 
@@ -95,7 +96,8 @@ class SelFlowModel(object):
                                    batch_size=self.batch_size_per_gpu,
                                    data_list_file=self.dataset_config['data_list_file'],
                                    img_dir=self.dataset_config['img_dir'],
-                   fake_flow_occ_dir=self.distillation_config['fake_flow_occ_dir'])
+                   fake_flow_occ_dir=self.self_supervision_config['fake_flow_occ_dir'],
+                   superpixel_dir=self.dataset_config['superpixel_dir'])
             iterator = dataset.create_batch_distillation_iterator(data_list=dataset.data_list, batch_size=dataset.batch_size,
                 shuffle=True, buffer_size=self.buffer_size, num_parallel_calls=self.num_input_threads) 
         else:
@@ -232,38 +234,41 @@ class SelFlowModel(object):
     
 
     def build_self_supervision(self, iterator, regularizer_scale=1e-4, train=True, trainable=True, is_scale=True):
-        batch_img1, batch_img2, flow_fw, flow_bw, occ_fw, occ_bw = iterator.get_next()
+        batch_img0, batch_img1, batch_img2, batch_img3, batch_img4, flow_12, flow_21, occ_12, occ_21, flow_23, flow_32, occ_23, occ_32, img2_superpixels = iterator.get_next()
         regularizer = slim.l2_regularizer(scale=regularizer_scale)
-        h = self.dataset_config['crop_h']
-        w = self.dataset_config['crop_w']
-        target_h = self.distillation_config['target_h']
-        target_w = self.distillation_config['target_w']           
-        offect_h = tf.random_uniform([], minval=0, maxval=h-target_h, dtype=tf.int32)
-        offect_w = tf.random_uniform([], minval=0, maxval=w-target_w, dtype=tf.int32)
- 
-        
-        batch_img1_cropped_patch = tf.image.crop_to_bounding_box(batch_img1, offect_h, offect_w, target_h, target_w)
-        batch_img2_cropped_patch = tf.image.crop_to_bounding_box(batch_img2, offect_h, offect_w, target_h, target_w)     
-        flow_fw_cropped_patch = tf.image.crop_to_bounding_box(flow_fw, offect_h, offect_w, target_h, target_w) 
-        flow_bw_cropped_patch = tf.image.crop_to_bounding_box(flow_bw, offect_h, offect_w, target_h, target_w) 
-        occ_fw_cropped_patch = tf.image.crop_to_bounding_box(occ_fw, offect_h, offect_w, target_h, target_w)
-        occ_bw_cropped_patch = tf.image.crop_to_bounding_box(occ_bw, offect_h, offect_w, target_h, target_w)
-        
-        flow_fw_patch, flow_bw_patch = pyramid_processing_bidirection(batch_img1_cropped_patch, batch_img2_cropped_patch, 
-            train=train, trainable=trainable, reuse=None, regularizer=regularizer, is_scale=is_scale)  
-        
-        occ_fw_patch, occ_bw_patch = occlusion(flow_fw_patch['full_res'], flow_bw_patch['full_res'])
-        mask_fw_patch = 1. - occ_fw_patch
-        mask_bw_patch = 1. - occ_bw_patch
 
-        losses = self.compute_losses(batch_img1_cropped_patch, batch_img2_cropped_patch, flow_fw_patch, flow_bw_patch, mask_fw_patch, mask_bw_patch, train=train, is_scale=is_scale)
+        r = tf.random_uniform(dtype=tf.int32, minval=0, maxval=tf.reduce_max(img2_superpixels), shape=[2]) #3
+
+        where_x = tf.ones(tf.shape(img2_superpixels))
+        where_y = tf.zeros(tf.shape(img2_superpixels))
+        self_supervision_mask = tf.where(tf.equal(img2_superpixels, r[0]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[1]), where_x, where_y) #+ tf.where(tf.equal(img2_superpixels, r[2]), where_x, where_y)
+    
+        self_supervision_mask = tf.expand_dims(self_supervision_mask, 3)
+        self_supervision_mask_2d = tf.tile(self_supervision_mask, [1, 1, 1, 2])        
+        self_supervision_mask = tf.tile(self_supervision_mask, [1, 1, 1, 3])        
+        img2_corrupt = tf.clip_by_value(batch_img2 - self_supervision_mask, 0., 1.) + tf.random.uniform(tf.shape(self_supervision_mask), 0, 1) * self_supervision_mask
+
+        flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32 = pyramid_processing_five_frame(batch_img0, batch_img1, img2_corrupt, batch_img3, batch_img4,
+            train=train, trainable=trainable, regularizer=regularizer, is_scale=is_scale)  
         
-        valid_mask_fw = tf.clip_by_value(occ_fw_patch - occ_fw_cropped_patch, 0., 1.)
-        valid_mask_bw = tf.clip_by_value(occ_bw_patch - occ_bw_cropped_patch, 0., 1.)
-        data_distillation_loss = {}
-        data_distillation_loss['distillation'] = (self.abs_robust_loss(flow_fw_cropped_patch-flow_fw_patch['full_res'], valid_mask_fw) + \
-                                       self.abs_robust_loss(flow_bw_cropped_patch-flow_bw_patch['full_res'], valid_mask_bw)) / 2
-        losses['data_distillation'] = data_distillation_loss
+        occ_fw_12, occ_bw_21 = occlusion(flow_fw_12['full_res'], flow_bw_21['full_res'])
+        mask_fw_12 = tf.clip_by_value(1. - occ_fw_12 - self_supervision_mask, 0., 1.) 
+        mask_bw_21 = tf.clip_by_value(1. - occ_bw_21 - self_supervision_mask, 0., 1.)
+        
+        occ_fw_23, occ_bw_32 = occlusion(flow_fw_23['full_res'], flow_bw_32['full_res'])
+        mask_fw_23 = tf.clip_by_value(1. - occ_fw_23 - self_supervision_mask, 0., 1.)
+        mask_bw_32 = tf.clip_by_value(1. - occ_bw_32 - self_supervision_mask, 0., 1.)
+
+        losses = self.compute_losses(batch_img1, batch_img2, batch_img3, 
+            flow_fw_12, flow_bw_21, flow_fw_23, flow_bw_32,
+            mask_fw_12, mask_bw_21, mask_fw_23, mask_bw_32, train=train, is_scale=is_scale)
+
+        self_supervision_loss = {}
+        self_supervision_loss['self-supervision'] = self.abs_robust_loss(flow_12-flow_fw_12['full_res'], self_supervision_mask_2d) + \
+                                       self.abs_robust_loss(flow_21-flow_bw_21['full_res'], self_supervision_mask_2d) + \
+                                       self.abs_robust_loss(flow_23-flow_fw_23['full_res'], self_supervision_mask_2d) + \
+                                       self.abs_robust_loss(flow_32-flow_bw_32['full_res'], self_supervision_mask_2d)
+        losses['self_supervision'] = self_supervision_loss
         
         l2_regularizer = tf.losses.get_regularization_losses()
         regularizer_loss = tf.add_n(l2_regularizer)
@@ -293,7 +298,7 @@ class SelFlowModel(object):
                     with tf.device('/gpu:%d' % i):
                         with tf.name_scope('tower_{}'.format(i)) as scope:
                             losses_, regularizer_loss_ = self.build(iterator, regularizer_scale=regularizer_scale, train=train, trainable=trainable, is_scale=is_scale, training_mode=training_mode) 
-                            optim_loss = losses_['census']['no_occlusion']
+                            optim_loss = losses_['census']['occlusion'] + losses_['self_supervision']['self-supervision']
                             # optim_loss = losses_['abs_robust_mean']['no_occlusion']
 
                             # Reuse variables for the next tower.
@@ -407,14 +412,67 @@ class SelFlowModel(object):
             print('Finish %d/%d' % (i+1, dataset.data_num))
 
     def generate_fake_flow_occlusion(self, restore_model, save_dir):
-        from test_datasets import BasicDataset
-        data_list_file = "./dataset/KITTI/id2.txt"
-        img_dir = "../datasets/KITTI/training"
-        save_dir = "../datasets/KITTI_flow/training"
-        dataset = BasicDataset(data_list_file=data_list_file, img_dir=img_dir, is_normalize_img=False)
-        save_name_list = dataset.data_list[:, 3]
+        dataset = BasicDataset(data_list_file=self.dataset_config['data_list_file'], img_dir=self.dataset_config['img_dir'])
+        save_name_list = dataset.data_list[:, 5]
+        iterator = dataset.create_one_shot_five_frame_iterator(dataset.data_list, num_parallel_calls=self.num_input_threads)
+
+        batch_img0, batch_img1, batch_img2, batch_img3, batch_img4 = iterator.get_next()
+        flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32 = pyramid_processing_five_frame(batch_img0, batch_img1, batch_img2, batch_img3, batch_img4,
+            train=False, trainable=False, regularizer=None, is_scale=True)  
+
+        occ_fw_12, occ_bw_21 = occlusion(flow_fw_12['full_res'], flow_bw_21['full_res'])
+        occ_fw_23, occ_bw_32 = occlusion(flow_fw_23['full_res'], flow_bw_32['full_res'])
+
+        flow_fw_12_full_res = flow_fw_12['full_res'] * 64. + 32768
+        flow_occ_12_fw = tf.concat([flow_fw_12_full_res, occ_fw_12], -1)
+        flow_occ_12_fw = tf.cast(flow_occ_12_fw, tf.uint16)
+        flow_bw_21_full_res = flow_bw_21['full_res'] * 64. + 32768
+        flow_occ_21_bw = tf.concat([flow_bw_21_full_res, occ_bw_21], -1)
+        flow_occ_21_bw = tf.cast(flow_occ_21_bw, tf.uint16)
+
+        flow_fw_23_full_res = flow_fw_23['full_res'] * 64. + 32768
+        flow_occ_23_fw = tf.concat([flow_fw_23_full_res, occ_fw_23], -1)
+        flow_occ_23_fw = tf.cast(flow_occ_23_fw, tf.uint16)
+        flow_bw_32_full_res = flow_bw_32['full_res'] * 64. + 32768
+        flow_occ_32_bw = tf.concat([flow_bw_32_full_res, occ_bw_32], -1)
+        flow_occ_32_bw = tf.cast(flow_occ_32_bw, tf.uint16)
+        
+        restore_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES) 
+        saver = tf.train.Saver(var_list=restore_vars)
+        sess = tf.Session()
+        sess.run(tf.global_variables_initializer()) 
+        sess.run(iterator.initializer) 
+        saver.restore(sess, restore_model)
+        #save_dir = '/'.join([self.save_dir, 'sample', self.model_name])
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)           
+        for i in range(dataset.data_num):
+            flow_occ_12, flow_occ_21, flow_occ_23, flow_occ_32 = sess.run([flow_occ_12_fw, flow_occ_21_bw, flow_occ_23_fw, flow_occ_32_bw])
+            
+            # opencv read and save image as bgr format, here we change rgb to bgr
+            np_flow_occ_12_fw = rgb_bgr(flow_occ_12[0])
+            np_flow_occ_21_bw = rgb_bgr(flow_occ_21[0])
+            np_flow_occ_12_fw = np_flow_occ_12_fw.astype(np.uint16)
+            np_flow_occ_21_bw = np_flow_occ_21_bw.astype(np.uint16)
+
+            np_flow_occ_23_fw = rgb_bgr(flow_occ_23[0])
+            np_flow_occ_32_bw = rgb_bgr(flow_occ_32[0])
+            np_flow_occ_23_fw = np_flow_occ_23_fw.astype(np.uint16)
+            np_flow_occ_32_bw = np_flow_occ_32_bw.astype(np.uint16)
+            
+            cv2.imwrite('%s/flow_occ_12_fw_%s.png' % (save_dir, save_name_list[i]), np_flow_occ_12_fw)
+            cv2.imwrite('%s/flow_occ_21_bw_%s.png' % (save_dir, save_name_list[i]), np_flow_occ_21_bw)
+            cv2.imwrite('%s/flow_occ_23_fw_%s.png' % (save_dir, save_name_list[i]), np_flow_occ_23_fw)
+            cv2.imwrite('%s/flow_occ_32_bw_%s.png' % (save_dir, save_name_list[i]), np_flow_occ_32_bw)
+            print('Finish %d/%d' % (i, dataset.data_num))            
+        
+    def eval(self, restore_model, save_dir, is_normalize_img=True):
+        from test_datasets_eval import BasicDataset
+        from error_metrics import flow_error_avg, outlier_pct, merge_dictionaries
+        dataset = BasicDataset(data_list_file=self.dataset_config['data_list_file'], img_dir=self.dataset_config['img_dir'], is_normalize_img=is_normalize_img)
+        save_name_list = dataset.data_list[:, -1]
         iterator = dataset.create_one_shot_iterator(dataset.data_list, num_parallel_calls=self.num_input_threads)
-        batch_img0, batch_img1, batch_img2 = iterator.get_next()
+        batch_img0, batch_img1, batch_img2, flow_noc, flow_occ, mask_noc, mask_occ = iterator.get_next()
         img_shape = tf.shape(batch_img0)
         h = img_shape[1]
         w = img_shape[2]
@@ -426,13 +484,16 @@ class SelFlowModel(object):
         batch_img1 = tf.image.resize_images(batch_img1, [new_h, new_w], method=1, align_corners=True)
         batch_img2 = tf.image.resize_images(batch_img2, [new_h, new_w], method=1, align_corners=True)
         
-        flow_fw, flow_bw = pyramid_processing(batch_img0, batch_img1, batch_img2, train=False, trainable=False, is_scale=True) 
-        flow_fw['full_res'] = flow_resize(flow_fw['full_res'], [h, w], method=1)
-        flow_bw['full_res'] = flow_resize(flow_bw['full_res'], [h, w], method=1)
-        
+        flow_fw, _ = pyramid_processing(batch_img0, batch_img1, batch_img2, train=False, trainable=False, is_scale=True) 
+        flow_fw['full_res'] = flow_resize(flow_fw['full_res'], [h, w], method=1)       
         flow_fw_color = flow_to_color(flow_fw['full_res'], mask=None, max_flow=256)
-        flow_bw_color = flow_to_color(flow_bw['full_res'], mask=None, max_flow=256)
-        
+        error_fw_color = flow_error_image(flow_fw['full_res'], flow_occ, mask_occ)
+        errors = {}
+        errors['EPE_noc'] = flow_error_avg(flow_noc, flow_fw['full_res'], mask_noc)
+        errors['EPE_all'] = flow_error_avg(flow_occ, flow_fw['full_res'], mask_occ)
+        errors['outliers_noc'] = outlier_pct(flow_noc, flow_fw['full_res'], mask_noc)
+        errors['outliers_all'] = outlier_pct(flow_occ, flow_fw['full_res'], mask_occ)
+        errors['F1_all'] = compute_Fl(flow_occ, flow_fw['full_res'], mask_occ)
         restore_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES) 
         saver = tf.train.Saver(var_list=restore_vars)
         sess = tf.Session()
@@ -440,18 +501,30 @@ class SelFlowModel(object):
         sess.run(iterator.initializer) 
         saver.restore(sess, restore_model)
         if not os.path.exists(save_dir):
-            os.makedirs(save_dir)           
+            os.makedirs(save_dir)
+
+        sum_EPE_noc = 0.
+        sum_EPE_all = 0.
+        sum_F1_all = 0.
+        sum_outliers_noc = 0.
+        sum_outliers_all = 0.
         for i in range(dataset.data_num):
-            np_flow_fw, np_flow_bw = sess.run([flow_fw['full_res'], flow_bw['full_res']])
-            #misc.imsave('%s/flow_fw_color_%s.png' % (save_dir, save_name_list[i]), np_flow_fw_color[0])
-            #misc.imsave('%s/flow_bw_color_%s.png' % (save_dir, save_name_list[i]), np_flow_bw_color[0])
-            write_flo('%s/flow_fw_%s.flo' % (save_dir, save_name_list[i]), np_flow_fw[0])
-            write_flo('%s/flow_bw_%s.flo' % (save_dir, save_name_list[i]), np_flow_bw[0])
+            np_flow_fw, np_flow_fw_color, np_error_fw_color = sess.run([flow_fw['full_res'], flow_fw_color, error_fw_color])
+            EPE_noc, EPE_all, outliers_noc, outliers_all, F1_all = sess.run([errors['EPE_noc'], errors['EPE_all'], errors['outliers_noc'], errors['outliers_all'], errors['F1_all']])
+            sum_EPE_noc += EPE_noc
+            sum_EPE_all += EPE_all
+            sum_outliers_noc += outliers_noc
+            sum_outliers_all += outliers_all
+            sum_F1_all += F1_all
+
+            misc.imsave('%s/%s.png' % (save_dir, save_name_list[i]), np_flow_fw_color[0])
+            misc.imsave('%s/error_%s.png' % (save_dir, save_name_list[i]), np_error_fw_color[0])
+            #write_flo('%s/flow_fw_%s.flo' % (save_dir, save_name_list[i]), np_flow_fw[0])
             print('Finish %d/%d' % (i+1, dataset.data_num))
 
-            #todo: name saving properly according to image
-            #segments = slic(img) and save
-        
+        print("EPE_noc: %f, EPE_all: %f" % (sum_EPE_noc/dataset.data_num, sum_EPE_all/dataset.data_num))
+        print("F1_all: %f" % (sum_F1_all/dataset.data_num))
+        print("outliers_noc: %f, outliers_all: %f" % (sum_outliers_noc/dataset.data_num, sum_outliers_all/dataset.data_num))
 
         
         
