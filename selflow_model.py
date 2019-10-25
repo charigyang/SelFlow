@@ -237,12 +237,13 @@ class SelFlowModel(object):
         batch_img0, batch_img1, batch_img2, batch_img3, batch_img4, flow_12, flow_21, occ_12, occ_21, flow_23, flow_32, occ_23, occ_32, img2_superpixels = iterator.get_next()
         regularizer = slim.l2_regularizer(scale=regularizer_scale)
 
-        r = tf.random_uniform(dtype=tf.int32, minval=0, maxval=tf.reduce_max(img2_superpixels), shape=[2]) #3
+        r = tf.random_uniform(dtype=tf.int32, minval=tf.reduce_min(img2_superpixels), maxval=tf.reduce_max(img2_superpixels), shape=[3]) #3
 
         where_x = tf.ones(tf.shape(img2_superpixels))
         where_y = tf.zeros(tf.shape(img2_superpixels))
-        self_supervision_mask = tf.where(tf.equal(img2_superpixels, r[0]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[1]), where_x, where_y) #+ tf.where(tf.equal(img2_superpixels, r[2]), where_x, where_y)
-    
+        self_supervision_mask = tf.where(tf.equal(img2_superpixels, r[0]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[1]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[2]), where_x, where_y)
+
+        self_supervision_mask = tf.clip_by_value(self_supervision_mask, 0., 1.)    
         self_supervision_mask = tf.expand_dims(self_supervision_mask, 3)
         self_supervision_mask_2d = tf.tile(self_supervision_mask, [1, 1, 1, 2])        
         self_supervision_mask = tf.tile(self_supervision_mask, [1, 1, 1, 3])        
@@ -274,6 +275,54 @@ class SelFlowModel(object):
         regularizer_loss = tf.add_n(l2_regularizer)
         return losses, regularizer_loss  
 
+    def build_mask(self, iterator, regularizer_scale=1e-4, train=True, trainable=True, is_scale=True):
+        batch_img0, batch_img1, batch_img2, batch_img3, batch_img4, flow_12, flow_21, occ_12, occ_21, flow_23, flow_32, occ_23, occ_32, img2_superpixels = iterator.get_next()
+        regularizer = slim.l2_regularizer(scale=regularizer_scale)
+
+        r = tf.random_uniform(dtype=tf.int32, minval=0, maxval=tf.reduce_max(img2_superpixels), shape=[2]) #3
+
+        where_x = tf.ones(tf.shape(img2_superpixels))
+        where_y = tf.zeros(tf.shape(img2_superpixels))
+        self_supervision_mask = tf.where(tf.equal(img2_superpixels, r[0]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[1]), where_x, where_y) #+ tf.where(tf.equal(img2_superpixels, r[2]), where_x, where_y)
+    
+        self_supervision_mask = tf.clip_by_value(self_supervision_mask, 0., 1.)    
+        self_supervision_mask = tf.expand_dims(self_supervision_mask, 3)
+        self_supervision_mask_2d = tf.tile(self_supervision_mask, [1, 1, 1, 2])        
+        self_supervision_mask = tf.tile(self_supervision_mask, [1, 1, 1, 3])        
+        img2_corrupt = tf.clip_by_value(batch_img2 - self_supervision_mask, 0., 1.) + tf.random.uniform(tf.shape(self_supervision_mask), 0, 1) * self_supervision_mask
+
+        flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32 = pyramid_processing_five_frame(batch_img0, batch_img1, img2_corrupt, batch_img3, batch_img4,
+            train=train, trainable=trainable, regularizer=regularizer, is_scale=is_scale)  
+        
+        occ_fw_12, occ_bw_21 = occlusion(flow_fw_12['full_res'], flow_bw_21['full_res'])
+        mask_fw_12 = tf.clip_by_value(1. - occ_fw_12 - self_supervision_mask, 0., 1.) 
+        mask_bw_21 = tf.clip_by_value(1. - occ_bw_21 - self_supervision_mask, 0., 1.)
+        
+        occ_fw_23, occ_bw_32 = occlusion(flow_fw_23['full_res'], flow_bw_32['full_res'])
+        mask_fw_23 = tf.clip_by_value(1. - occ_fw_23 - self_supervision_mask, 0., 1.)
+        mask_bw_32 = tf.clip_by_value(1. - occ_bw_32 - self_supervision_mask, 0., 1.)
+
+        losses = self.compute_losses(batch_img1, batch_img2, batch_img3, 
+            flow_fw_12, flow_bw_21, flow_fw_23, flow_bw_32,
+            mask_fw_12, mask_bw_21, mask_fw_23, mask_bw_32, train=train, is_scale=is_scale)
+
+        mask_loss = {}
+        mask_loss['mask'] = self.abs_robust_loss(flow_12-flow_fw_12['full_res'], mask_fw_12) + \
+                                       self.abs_robust_loss(flow_21-flow_bw_21['full_res'], mask_bw_21) + \
+                                       self.abs_robust_loss(flow_23-flow_fw_23['full_res'], mask_fw_23) + \
+                                       self.abs_robust_loss(flow_32-flow_bw_32['full_res'], mask_bw_32)
+        losses['mask'] = mask_loss
+
+        self_supervision_loss = {}
+        self_supervision_loss['self-supervision'] = self.abs_robust_loss(flow_12-flow_fw_12['full_res'], self_supervision_mask_2d) + \
+                                       self.abs_robust_loss(flow_21-flow_bw_21['full_res'], self_supervision_mask_2d) + \
+                                       self.abs_robust_loss(flow_23-flow_fw_23['full_res'], self_supervision_mask_2d) + \
+                                       self.abs_robust_loss(flow_32-flow_bw_32['full_res'], self_supervision_mask_2d)
+        losses['self_supervision'] = self_supervision_loss
+        
+        l2_regularizer = tf.losses.get_regularization_losses()
+        regularizer_loss = tf.add_n(l2_regularizer)
+        return losses, regularizer_loss  
 
     def build(self, iterator, regularizer_scale=1e-4, train=True, trainable=True, is_scale=True, training_mode='no_distillation'):
         if training_mode == 'no_self_supervision':
@@ -298,8 +347,8 @@ class SelFlowModel(object):
                     with tf.device('/gpu:%d' % i):
                         with tf.name_scope('tower_{}'.format(i)) as scope:
                             losses_, regularizer_loss_ = self.build(iterator, regularizer_scale=regularizer_scale, train=train, trainable=trainable, is_scale=is_scale, training_mode=training_mode) 
-                            optim_loss = losses_['census']['occlusion'] + losses_['self_supervision']['self-supervision']
-                            # optim_loss = losses_['abs_robust_mean']['no_occlusion']
+                            # optim_loss = losses_['census']['occlusion'] + losses_['self_supervision']['self-supervision']
+                            optim_loss = losses_['census']['no_occlusion']
 
                             # Reuse variables for the next tower.
                             tf.get_variable_scope().reuse_variables()
@@ -493,7 +542,6 @@ class SelFlowModel(object):
         errors['EPE_all'] = flow_error_avg(flow_occ, flow_fw['full_res'], mask_occ)
         errors['outliers_noc'] = outlier_pct(flow_noc, flow_fw['full_res'], mask_noc)
         errors['outliers_all'] = outlier_pct(flow_occ, flow_fw['full_res'], mask_occ)
-        errors['F1_all'] = compute_Fl(flow_occ, flow_fw['full_res'], mask_occ)
         restore_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES) 
         saver = tf.train.Saver(var_list=restore_vars)
         sess = tf.Session()
@@ -505,26 +553,23 @@ class SelFlowModel(object):
 
         sum_EPE_noc = 0.
         sum_EPE_all = 0.
-        sum_F1_all = 0.
         sum_outliers_noc = 0.
         sum_outliers_all = 0.
         for i in range(dataset.data_num):
             np_flow_fw, np_flow_fw_color, np_error_fw_color = sess.run([flow_fw['full_res'], flow_fw_color, error_fw_color])
-            EPE_noc, EPE_all, outliers_noc, outliers_all, F1_all = sess.run([errors['EPE_noc'], errors['EPE_all'], errors['outliers_noc'], errors['outliers_all'], errors['F1_all']])
+            EPE_noc, EPE_all, outliers_noc, outliers_all = sess.run([errors['EPE_noc'], errors['EPE_all'], errors['outliers_noc'], errors['outliers_all']])
             sum_EPE_noc += EPE_noc
             sum_EPE_all += EPE_all
             sum_outliers_noc += outliers_noc
             sum_outliers_all += outliers_all
-            sum_F1_all += F1_all
 
-            misc.imsave('%s/%s.png' % (save_dir, save_name_list[i]), np_flow_fw_color[0])
+            misc.imsave('%s/%s_10.png' % (save_dir, save_name_list[i]), np_flow_fw_color[0])
             misc.imsave('%s/error_%s.png' % (save_dir, save_name_list[i]), np_error_fw_color[0])
             #write_flo('%s/flow_fw_%s.flo' % (save_dir, save_name_list[i]), np_flow_fw[0])
             print('Finish %d/%d' % (i+1, dataset.data_num))
 
         print("EPE_noc: %f, EPE_all: %f" % (sum_EPE_noc/dataset.data_num, sum_EPE_all/dataset.data_num))
-        print("F1_all: %f" % (sum_F1_all/dataset.data_num))
-        print("outliers_noc: %f, outliers_all: %f" % (sum_outliers_noc/dataset.data_num, sum_outliers_all/dataset.data_num))
+        print("F1_noc: %f, F1_all: %f" % (sum_outliers_noc/dataset.data_num, sum_outliers_all/dataset.data_num))
 
         
         
