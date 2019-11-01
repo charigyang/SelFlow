@@ -14,7 +14,7 @@ from tensorflow.contrib import slim
 import matplotlib.pyplot as plt
 from network import pyramid_processing, pyramid_processing_five_frame, get_shape
 from datasets import BasicDataset
-from utils import average_gradients, lrelu, occlusion, rgb_bgr, compute_Fl, mask
+from utils import average_gradients, lrelu, occlusion, rgb_bgr, compute_Fl
 from data_augmentation import flow_resize
 from flowlib import flow_to_color, write_flo, flow_error_image
 from warp import tf_warp
@@ -243,8 +243,7 @@ class SelFlowModel(object):
         self_supervision_mask = tf.where(tf.equal(img2_superpixels, r[0]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[1]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[2]), where_x, where_y)
 
         self_supervision_mask = tf.clip_by_value(self_supervision_mask, 0., 1.)    
-        self_supervision_mask = tf.expand_dims(self_supervision_mask, 3)
-        self_supervision_mask_2d = tf.tile(self_supervision_mask, [1, 1, 1, 2])        
+        self_supervision_mask = tf.expand_dims(self_supervision_mask, 3)      
         self_supervision_mask = tf.tile(self_supervision_mask, [1, 1, 1, 3])        
         img2_corrupt = tf.clip_by_value(batch_img2 - self_supervision_mask, 0., 1.) + tf.random.uniform(tf.shape(self_supervision_mask), 0, 1) * self_supervision_mask
 
@@ -252,29 +251,24 @@ class SelFlowModel(object):
             train=train, trainable=trainable, regularizer=regularizer, is_scale=is_scale)  
         
         occ_fw_12, occ_bw_21 = occlusion(flow_fw_12['full_res'], flow_bw_21['full_res'])
-        mask_fw_12 = tf.clip_by_value(1. - occ_fw_12, 0., 1.)# - self_supervision_mask, 0., 1.) 
-        mask_bw_21 = tf.clip_by_value(1. - occ_bw_21, 0., 1.)# - self_supervision_mask, 0., 1.)
+        mask_fw_12 = 1. - occ_fw_12
+        mask_bw_21 = 1. - occ_bw_21  
         
         occ_fw_23, occ_bw_32 = occlusion(flow_fw_23['full_res'], flow_bw_32['full_res'])
-        mask_fw_23 = tf.clip_by_value(1. - occ_fw_23, 0., 1.)# - self_supervision_mask, 0., 1.)
-        mask_bw_32 = tf.clip_by_value(1. - occ_bw_32, 0., 1.)# - self_supervision_mask, 0., 1.)
+        mask_fw_23 = 1. - occ_fw_23
+        mask_bw_32 = 1. - occ_bw_32 
 
         losses = self.compute_losses(batch_img1, batch_img2, batch_img3, 
             flow_fw_12, flow_bw_21, flow_fw_23, flow_bw_32,
             mask_fw_12, mask_bw_21, mask_fw_23, mask_bw_32, train=train, is_scale=is_scale)
 
         self_supervision_loss = {}
-        """
-        self_supervision_loss['self-supervision'] = self.abs_robust_loss(flow_12-flow_fw_12['full_res'], self_supervision_mask_2d) + \
-                                       self.abs_robust_loss(flow_21-flow_bw_21['full_res'], self_supervision_mask_2d) + \
-                                       self.abs_robust_loss(flow_23-flow_fw_23['full_res'], self_supervision_mask_2d) + \
-                                       self.abs_robust_loss(flow_32-flow_bw_32['full_res'], self_supervision_mask_2d)
-        """
-        self_supervision_loss['self-supervision'] = self.abs_robust_loss(flow_12-flow_fw_12['full_res'], mask(occ_fw_12 - occ_12)) + \
-                                       self.abs_robust_loss(flow_21-flow_bw_21['full_res'], mask(occ_bw_21 - occ_21)) + \
-                                       self.abs_robust_loss(flow_23-flow_fw_23['full_res'], mask(occ_fw_23 - occ_23)) + \
-                                       self.abs_robust_loss(flow_32-flow_bw_32['full_res'], mask(occ_bw_32 - occ_32))
         
+        self_supervision_loss['self-supervision'] = self.abs_robust_loss(flow_12-flow_fw_12['full_res'], tf.clip_by_value(occ_fw_12 - occ_12, 0., 1.)) + \
+                                       self.abs_robust_loss(flow_21-flow_bw_21['full_res'], tf.clip_by_value(occ_bw_21 - occ_21, 0., 1.)) + \
+                                       self.abs_robust_loss(flow_23-flow_fw_23['full_res'], tf.clip_by_value(occ_fw_23 - occ_23, 0., 1.)) + \
+                                       self.abs_robust_loss(flow_32-flow_bw_32['full_res'], tf.clip_by_value(occ_bw_32 - occ_32, 0., 1.))
+
         losses['self_supervision'] = self_supervision_loss
         
         l2_regularizer = tf.losses.get_regularization_losses()

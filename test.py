@@ -10,7 +10,7 @@ from config.extract_config import config_dict
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
 
 # autonatically select one free gpu
-#os.system('nvidia-smi -q -d Memory |grep -A4 GPU|grep Free >tmp')
+#os.system('nvidia-smi -q -d Memory |grep -A4 GPU|grep Free >tmp')d
 #os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmax([int(x.split()[2]) for x in open('tmp','r').readlines()]))
 #os.system('rm tmp')
 

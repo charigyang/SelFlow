@@ -18,8 +18,3 @@ for l,s in zip(load_list,save_list):
 	cv2.imwrite(os.path.join(save_dir,s), seg)
 	print(seg)
 	print(s)
-
-        """        
-        superpixels = np.load(self.superpixel_dir + "/image_2/000000_02.npy")
-        superpixels = tf.convert_to_tensor(superpixels, dtype=tf.int32)
-        """
