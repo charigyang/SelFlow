@@ -16,7 +16,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
 
 
 def main(_):
-    config = config_dict('./config/config_test.ini')
+    config = config_dict('./config/config_vid_test.ini')
     run_config = config['run']
     dataset_config = config['dataset']    
     self_supervision_config = config['self_supervision']

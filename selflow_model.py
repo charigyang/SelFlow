@@ -82,12 +82,13 @@ class SelFlowModel(object):
             os.makedirs(('/'.join([self.summary_dir, 'test'])))             
 
     def create_dataset_and_iterator(self, training_mode='no_self_supervision'):
-        if training_mode=='no_self_supervision':
+        if training_mode==('no_self_supervision' or 'no_occlusion'):
             dataset = BasicDataset(crop_h=self.dataset_config['crop_h'], 
                                    crop_w=self.dataset_config['crop_w'],
                                    batch_size=self.batch_size_per_gpu,
                                    data_list_file=self.dataset_config['data_list_file'],
-                                   img_dir=self.dataset_config['img_dir'])
+                                   img_dir=self.dataset_config['img_dir'],
+                                   color_space=self.dataset_config['color_space'])
             iterator = dataset.create_batch_iterator(data_list=dataset.data_list, batch_size=dataset.batch_size,
                 shuffle=True, buffer_size=self.buffer_size, num_parallel_calls=self.num_input_threads)   
         elif training_mode == 'self_supervision':
@@ -96,12 +97,13 @@ class SelFlowModel(object):
                                    batch_size=self.batch_size_per_gpu,
                                    data_list_file=self.dataset_config['data_list_file'],
                                    img_dir=self.dataset_config['img_dir'],
+                                   color_space=self.dataset_config['color_space'],
                    fake_flow_occ_dir=self.self_supervision_config['fake_flow_occ_dir'],
                    superpixel_dir=self.dataset_config['superpixel_dir'])
             iterator = dataset.create_batch_distillation_iterator(data_list=dataset.data_list, batch_size=dataset.batch_size,
                 shuffle=True, buffer_size=self.buffer_size, num_parallel_calls=self.num_input_threads) 
         else:
-            raise ValueError('Invalid training_mode. Training_mode should be one of {no_self_supervision, self_supervision}')
+            raise ValueError('Invalid training_mode. Training_mode should be one of {no_occlusion, no_self_supervision, self_supervision}')
         return dataset, iterator
 
     def epe_loss(self, diff, mask):
@@ -208,10 +210,18 @@ class SelFlowModel(object):
                 tf.summary.scalar(loss_name, loss_value)
 
     def build_no_occlusion(self, iterator, regularizer_scale=1e-4, train=True, trainable=True, is_scale=True):
-        batch_img0, batch_img1, batch_img2, batch_img3, batch_img4 = iterator.get_next()
-        regularizer = slim.l2_regularizer(scale=regularizer_scale)
-        flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32 = pyramid_processing_five_frame(batch_img0, batch_img1, batch_img2, batch_img3, batch_img4,
-            train=train, trainable=trainable, regularizer=regularizer, is_scale=is_scale)  
+        if self.dataset_config['color_space']=='rgb':
+            batch_img0, batch_img1, batch_img2, batch_img3, batch_img4 = iterator.get_next()
+            regularizer = slim.l2_regularizer(scale=regularizer_scale)
+            flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32 = pyramid_processing_five_frame(batch_img0, batch_img1, batch_img2, batch_img3, batch_img4,
+                train=train, trainable=trainable, regularizer=regularizer, is_scale=is_scale)  
+        elif self.dataset_config['color_space']=='lab':
+            batch_img0, batch_img1, batch_img2, batch_img3, batch_img4, lab0, lab1, lab2, lab3, lab4 = iterator.get_next()
+            regularizer = slim.l2_regularizer(scale=regularizer_scale)
+            flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32 = pyramid_processing_five_frame(lab0, lab1, lab2, lab3, lab4,
+                train=train, trainable=trainable, regularizer=regularizer, is_scale=is_scale)  
+
+
         
 
 
@@ -233,7 +243,7 @@ class SelFlowModel(object):
         return losses, regularizer_loss 
 
     def build_self_supervision(self, iterator, regularizer_scale=1e-4, train=True, trainable=True, is_scale=True):
-        batch_img0, batch_img1, batch_img2, batch_img3, batch_img4, flow_12, flow_21, occ_12, occ_21, flow_23, flow_32, occ_23, occ_32, img2_superpixels = iterator.get_next()
+        batch_img0, batch_img1, batch_img2, batch_img3, batch_img4, flow_12, flow_21, occ_12, occ_21, flow_23, flow_32, occ_23, occ_32, img2_superpixels, lab0, lab1, lab2, lab3, lab4 = iterator.get_next()
         regularizer = slim.l2_regularizer(scale=regularizer_scale)
 
         r = tf.random_uniform(dtype=tf.int32, minval=tf.reduce_min(img2_superpixels), maxval=tf.reduce_max(img2_superpixels), shape=[3]) #3
@@ -242,12 +252,19 @@ class SelFlowModel(object):
         where_y = tf.zeros(tf.shape(img2_superpixels))
         self_supervision_mask = tf.where(tf.equal(img2_superpixels, r[0]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[1]), where_x, where_y) + tf.where(tf.equal(img2_superpixels, r[2]), where_x, where_y)
 
-        self_supervision_mask = tf.clip_by_value(self_supervision_mask, 0., 1.)    
-        self_supervision_mask = tf.expand_dims(self_supervision_mask, 3)      
-        self_supervision_mask = tf.tile(self_supervision_mask, [1, 1, 1, 3])        
-        img2_corrupt = tf.clip_by_value(batch_img2 - self_supervision_mask, 0., 1.) + tf.random.uniform(tf.shape(self_supervision_mask), 0, 1) * self_supervision_mask
-
-        flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32 = pyramid_processing_five_frame(batch_img0, batch_img1, img2_corrupt, batch_img3, batch_img4,
+        self_supervision_mask = tf.clip_by_value(self_supervision_mask, 0., 1.)
+        #lab2_L = tf.clip_by_value(lab2[:,:,:,0] - self_supervision_mask, 0., 1.) + tf.random.uniform(tf.shape(self_supervision_mask), 0, 1) * self_supervision_mask
+        L_min = tf.reduce_min(lab2[:,:,:,0])
+        L_max = tf.reduce_max(lab2[:,:,:,0])
+        lab2_L = tf.clip_by_value(lab2[:,:,:,0] - (L_max-L_min)*self_supervision_mask, L_min, L_max) + tf.random.uniform(tf.shape(self_supervision_mask), 0, L_max-L_min) * self_supervision_mask
+        a_min = tf.reduce_min(lab2[:,:,:,1])
+        a_max = tf.reduce_max(lab2[:,:,:,1])
+        lab2_a = tf.clip_by_value(lab2[:,:,:,1] - (a_max-a_min)*self_supervision_mask, a_min, a_max) + tf.random.uniform(tf.shape(self_supervision_mask), 0, a_max-a_min) * self_supervision_mask
+        b_min = tf.reduce_min(lab2[:,:,:,2])
+        b_max = tf.reduce_max(lab2[:,:,:,2])
+        lab2_b = tf.clip_by_value(lab2[:,:,:,2] - (b_max-b_min)*self_supervision_mask, b_min, b_max) + tf.random.uniform(tf.shape(self_supervision_mask), 0, b_max-b_min) * self_supervision_mask
+        lab2_corrupt = tf.stack([lab2_L, lab2_a, lab2_b], 3)
+        flow_fw_12, flow_bw_10, flow_fw_23, flow_bw_21, flow_fw_34, flow_bw_32 = pyramid_processing_five_frame(lab0, lab1, lab2_corrupt, lab3, lab4,
             train=train, trainable=trainable, regularizer=regularizer, is_scale=is_scale)  
         
         occ_fw_12, occ_bw_21 = occlusion(flow_fw_12['full_res'], flow_bw_21['full_res'])
@@ -287,7 +304,12 @@ class SelFlowModel(object):
     def create_train_op(self, optim, iterator, global_step, regularizer_scale=1e-4, train=True, trainable=True, is_scale=True, training_mode='no_distillation'):  
         if self.num_gpus == 1:
             losses, regularizer_loss = self.build(iterator, regularizer_scale=regularizer_scale, train=train, trainable=trainable, is_scale=is_scale, training_mode=training_mode)
-            optim_loss = losses['abs_robust_mean']['no_occlusion']
+            if training_mode == 'no_occlusion':
+                optim_loss = losses_['census']['no_occlusion']                            
+            elif training_mode == 'no_self_supervision':
+                optim_loss = losses_['census']['occlusion']
+            elif training_mode == 'self_supervision': 
+                optim_loss = losses_['census']['occlusion'] + losses_['self_supervision']['self-supervision']
             train_op = optim.minimize(optim_loss, var_list=tf.trainable_variables(), global_step=global_step)            
         else:
             tower_grads = []
@@ -298,8 +320,12 @@ class SelFlowModel(object):
                     with tf.device('/gpu:%d' % i):
                         with tf.name_scope('tower_{}'.format(i)) as scope:
                             losses_, regularizer_loss_ = self.build(iterator, regularizer_scale=regularizer_scale, train=train, trainable=trainable, is_scale=is_scale, training_mode=training_mode) 
-                            optim_loss = losses_['census']['occlusion'] + losses_['self_supervision']['self-supervision']
-                            # optim_loss = losses_['census']['occlusion']
+                            if training_mode == 'no_occlusion':
+                                optim_loss = losses_['census']['no_occlusion']                            
+                            elif training_mode == 'no_self_supervision':
+                                optim_loss = losses_['census']['occlusion']
+                            elif training_mode == 'self_supervision': 
+                                optim_loss = losses_['census']['occlusion'] + losses_['self_supervision']['self-supervision']
 
                             # Reuse variables for the next tower.
                             tf.get_variable_scope().reuse_variables()
@@ -374,7 +400,8 @@ class SelFlowModel(object):
     def test(self, restore_model, save_dir, is_normalize_img=True):
         from test_datasets import BasicDataset
         dataset = BasicDataset(data_list_file=self.dataset_config['data_list_file'], img_dir=self.dataset_config['img_dir'], is_normalize_img=is_normalize_img)
-        save_name_list = dataset.data_list[:, -1]
+        #save_name_list = dataset.data_list[:, -1]
+        save_name_list = dataset.data_list[:, 2]
         iterator = dataset.create_one_shot_iterator(dataset.data_list, num_parallel_calls=self.num_input_threads)
         batch_img0, batch_img1, batch_img2 = iterator.get_next()
         img_shape = tf.shape(batch_img0)
@@ -405,10 +432,18 @@ class SelFlowModel(object):
             os.makedirs(save_dir)           
         for i in range(dataset.data_num):
             np_flow_fw, np_flow_bw, np_flow_fw_color, np_flow_bw_color = sess.run([flow_fw['full_res'], flow_bw['full_res'], flow_fw_color, flow_bw_color])
-            misc.imsave('%s/flow_fw_color_%s.png' % (save_dir, save_name_list[i]), np_flow_fw_color[0])
-            misc.imsave('%s/flow_bw_color_%s.png' % (save_dir, save_name_list[i]), np_flow_bw_color[0])
-            write_flo('%s/flow_fw_%s.flo' % (save_dir, save_name_list[i]), np_flow_fw[0])
-            write_flo('%s/flow_bw_%s.flo' % (save_dir, save_name_list[i]), np_flow_bw[0])
+            directory = ('%s/color/%s' % (save_dir, save_name_list[i][:-9]))
+            directory2 = ('%s/flow/%s' % (save_dir, save_name_list[i][:-9]))
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+            if not os.path.exists(directory2):
+                os.makedirs(directory2)
+            misc.imsave('%s/color/%s.png' % (save_dir, save_name_list[i][:-4]), np_flow_fw_color[0]) 
+            write_flo('%s/flow/%s.flo' % (save_dir, save_name_list[i][:-4]), np_flow_fw[0]) #dont forget to change this back
+            #misc.imsave('%s/flow_fw_color_%s.png' % (save_dir, save_name_list[i]), np_flow_fw_color[0]) 
+            #misc.imsave('%s/flow_bw_color_%s.png' % (save_dir, save_name_list[i]), np_flow_bw_color[0])
+            #write_flo('%s/flow_fw_%s.flo' % (save_dir, save_name_list[i][:-4]), np_flow_fw[0]) #dont forget to change this back
+            #write_flo('%s/flow_bw_%s.flo' % (save_dir, save_name_list[i]), np_flow_bw[0])
             print('Finish %d/%d' % (i+1, dataset.data_num))
 
     def generate_fake_flow_occlusion(self, restore_model, save_dir):

@@ -17,7 +17,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
 
 
 def main(_):
-    config = config_dict('./config/config.ini')
+    config = config_dict('./config/config_cam.ini')
     run_config = config['run']
     dataset_config = config['dataset']    
     self_supervision_config = config['self_supervision']
@@ -47,7 +47,7 @@ def main(_):
                          is_restore_model=run_config['is_restore_model'],
                          restore_model=run_config['restore_model'],
                          dataset_config=dataset_config,
-                         self_supervision_config=self_supervision_config
+                         self_supervision_config=self_supervision_config,
                          )
     if run_config['mode'] == "train":
         model.train()

@@ -48,9 +48,15 @@ class BasicDataset(object):
     # For Validation or Testing
     def preprocess_one_shot(self, filename_queue):
         img0, img1, img2 = self.read_and_decode(filename_queue)
+        """
+        #if RGB do this
         img0 = img0 / 255.
         img1 = img1 / 255.
         img2 = img2 / 255.  
+        """
+        img0 = rgb_to_lab(img0) / 100.
+        img1 = rgb_to_lab(img1) / 100.
+        img2 = rgb_to_lab(img2) / 100. 
         
         if self.is_normalize_img:
             img0 = mvn(img0)

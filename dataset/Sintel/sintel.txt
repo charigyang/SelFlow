@@ -1,0 +1,1 @@
+['../../../datasets/Sintel/training/clean', '../../../datasets/Sintel/training/final']
